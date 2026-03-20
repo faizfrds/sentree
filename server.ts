@@ -23,40 +23,64 @@ async function startServer() {
   await consumer.onMessage(async (message: any) => {
     console.log(`[Worker] Processing AOI: ${message.aoi_id}`);
 
-    // 1. Fetch real satellite time-series images via NASA GIBS
-    const images = await fetchTimeseriesImages(message.coords);
+    // 1. Fetch 30 satellite images: 3 days × 10 sub-daily samples at 30-min intervals
+    const bundles = await fetchTimeseriesImages(message.coords);
 
-    // 2. Run Roboflow YOLO inference on each image
-    const results = await Promise.all(
-      images.map((img) =>
-        detectDeforestationSegments(img.imageBase64, message.coords.lat)
-      )
+    // 2. For each day bundle, run YOLO on all 10 images and compute the average
+    //    deforestation area — averaging across intraday samples reduces cloud cover bias
+    const dayResults = await Promise.all(
+      bundles.map(async (bundle) => {
+        const detectionSets = await Promise.all(
+          bundle.images.map((img) =>
+            detectDeforestationSegments(img.imageBase64, message.coords.lat)
+          )
+        );
+
+        const perImageAreas = detectionSets.map((dets) =>
+          dets.reduce((acc, det) => acc + det.area_sqkm, 0)
+        );
+        const avgArea = perImageAreas.reduce((a, b) => a + b, 0) / perImageAreas.length;
+
+        // Use the middle image as the representative display frame
+        const midIdx = Math.floor(bundle.images.length / 2);
+
+        console.log(
+          `[Worker] ${bundle.label} (${bundle.date}): avg area=${avgArea.toFixed(2)} sq km ` +
+          `across ${bundle.images.length} samples [${perImageAreas.map(a => a.toFixed(2)).join(', ')}]`
+        );
+
+        return {
+          label: bundle.label,
+          date: bundle.date,
+          avgArea,
+          representativeImage: bundle.images[midIdx].imageBase64,
+          representativeDetections: detectionSets[midIdx],
+        };
+      })
     );
 
-    // 3. Aggregate total detected deforestation area per timestamp
-    const areas = results.map((r) =>
-      r.reduce((acc, det) => acc + det.area_sqkm, 0)
-    );
+    // 3. Use per-day averaged areas for the growth trend comparison
+    const areas = dayResults.map((r) => r.avgArea);
     const [areaT0, areaT30, areaT60] = areas;
 
     console.log(
-      `[Worker] Areas: T0=${areaT0.toFixed(2)}, T-30=${areaT30.toFixed(2)}, T-60=${areaT60.toFixed(2)} sq km`
+      `[Worker] Avg areas — T0=${areaT0.toFixed(2)}, T-30=${areaT30.toFixed(2)}, T-60=${areaT60.toFixed(2)} sq km`
     );
 
-    // 4. Persist results to Redis (images, detections, and areas)
+    // 4. Persist results to Redis — frames shape is unchanged so the frontend works as-is
     await redis.setAreaHistory(message.aoi_id, {
       areas,
-      timestamps: images.map((i) => i.date),
-      frames: images.map((img, i) => ({
-        label: img.label,
-        date: img.date,
-        imageBase64: img.imageBase64,
-        detections: results[i],
+      timestamps: dayResults.map((r) => r.date),
+      frames: dayResults.map((r) => ({
+        label: r.label,
+        date: r.date,
+        imageBase64: r.representativeImage,
+        detections: r.representativeDetections,
       })),
       timestamp: new Date().toISOString(),
     });
 
-    // 5. Alert if area is growing across all three periods
+    // 5. Alert if averaged area is growing across all three periods
     if (areaT0 > areaT30 && areaT30 > areaT60) {
       console.log(
         `\x1b[31m[ALERT] DEFORESTATION TREND DETECTED in AOI: ${message.aoi_id}! ` +
