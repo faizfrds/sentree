@@ -1,4 +1,4 @@
-# Sentree — Engineer Onboarding Guide
+# Sentree
 
 ## What Is Sentree?
 
