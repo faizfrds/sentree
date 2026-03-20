@@ -69,12 +69,24 @@ Two reasons from the architecture: (1) Speed — results need to be available to
 
 ### 5. NASA GIBS API — Satellite Imagery ([backend/data_fetcher/geengine_worker.ts](backend/data_fetcher/geengine_worker.ts))
 
-**What it is:** NASA's Global Imagery Browse Services — a free WMS (Web Map Service) serving MODIS satellite imagery. No API key required.
+**What it is:** NASA's Global Imagery Browse Services — a free WMS (Web Map Service) serving satellite imagery from multiple geostationary and polar-orbiting sources. No API key required.
 
 **What it does here:**
 - Given coordinates + a 0.25° radius (~25 km), builds a bounding box
-- Fetches 3 PNG images at T0, T-30, T-60 days using MODIS Terra True Color layer
-- Returns each as base64-encoded strings for downstream processing
+- Selects the best satellite for the given longitude (see table below)
+- For sub-daily satellites: fetches **10 images per day** at 30-minute intervals centered on the local solar noon, across T0, T-30, and T-60 days (**30 images total**)
+- For the MODIS fallback: fetches 1 daily composite per day (3 images total)
+- The solar noon window is computed dynamically from longitude — `solar noon UTC = 12 - (lng / 15)` — so the sampling window is always local daytime regardless of where the coordinates are
+- All responses are content-type validated; XML error responses from GIBS throw before reaching Roboflow
+
+**Satellite selection by longitude:**
+
+| Longitude range | Satellite | Sub-daily? | Notes |
+|---|---|---|---|
+| −145° to −5° | **GOES-East** | Yes (10 samples/day) | Americas |
+| 70° to 160° | **Himawari-9** | Yes (10 samples/day) | Asia-Pacific (incl. Sumatra, Australia, Japan) |
+| >160° or <−145° | **GOES-West** | Yes (10 samples/day) | Far Pacific, Hawaii |
+| −5° to 70° | **MODIS-Terra** | No (1 sample/day) | Europe, Africa, Middle East — no geostationary source in GIBS |
 
 **Why not Google Earth Engine?**
 No auth needed with GIBS, making local development and CI trivially easy.
@@ -94,11 +106,11 @@ No auth needed with GIBS, making local development and CI trivially easy.
   1° longitude ≈ 111.32 × cos(lat) km
   ```
 
-**Key output:** Per-detection `area_sqkm`, which feeds the growth comparison logic.
+**Key output:** Per-detection `area_sqkm`, aggregated per image, then **averaged across all 10 intraday samples** to produce a cloud-cover-resistant area estimate per day.
 
 **Growth alert logic (in [server.ts](server.ts)):**
 ```
-if areaT0 > areaT30 > areaT60 → ACTIVE DEFORESTATION (alert)
+if avgArea(T0) > avgArea(T-30) > avgArea(T-60) → ACTIVE DEFORESTATION (alert)
 else → STABLE / NON-THREAT
 ```
 
@@ -136,13 +148,20 @@ User enters coords → POST /api/monitor
                                           │
                               Kafka Consumer picks up job
                                           │
-                              NASA GIBS: fetch T0, T-30, T-60 images
+                              Select satellite based on longitude
+                              (GOES-East / Himawari-9 / GOES-West / MODIS)
                                           │
-                              Roboflow YOLO: detect on each image (×3)
+                              NASA GIBS: fetch 10 images × 3 days = 30 images
+                              (30-min intervals, centered on local solar noon)
                                           │
-                              Compare areas: T0 > T-30 > T-60?
+                              Roboflow YOLO: detect on all 30 images
+                                          │
+                              Average area per day → [avgT0, avgT-30, avgT-60]
+                                          │
+                              Compare: avgT0 > avgT-30 > avgT-60?
                                           │
                               Redis: store results {frames, areas, alert}
+                              (representative mid-window image per day)
                                           │
                          Frontend polls GET /api/history/:aoi_id
                                           │
