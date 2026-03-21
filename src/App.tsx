@@ -263,13 +263,6 @@ const Sentree = () => {
           <div className="text-[10px] text-white/20 uppercase tracking-widest">
             © 2026 Sentree by Faiz Firdaus.
           </div>
-          <div className="flex gap-8">
-            {['Kafka Mock', 'Redis Mock', 'GEE Mock', 'YOLOv11'].map((tech) => (
-              <div key={tech} className="text-[10px] font-bold text-white/40 uppercase tracking-widest border-b border-white/10 pb-1">
-                {tech}
-              </div>
-            ))}
-          </div>
         </div>
       </footer>
     </div>

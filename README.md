@@ -1,144 +1,64 @@
 # Sentree
 
+## The Problem: Sumatra's Vanishing Rainforest
+
+Sumatra is home to one of the world's oldest and most biodiverse rainforests — a 300-million-year-old ecosystem that spans roughly 480,000 km². It is the last place on Earth where tigers, orangutans, rhinos, and elephants share the same habitat.
+
+Over the past 30 years, **Sumatra has lost more than half of its forest cover**. Between 1990 and 2020, approximately 15 million hectares were cleared — an area larger than England — largely driven by palm oil expansion, illegal logging, and pulpwood plantations. What remains is fragmented, degraded, and under continuous pressure.
+
+The consequences extend far beyond biodiversity. Sumatra's forests act as a natural sponge: they absorb rainfall, anchor soil, and regulate the flow of water through river catchments. When those forests are stripped away, the consequences are severe and immediate:
+
+- **Flash floods in monsoon season** have become dramatically more frequent and intense. Provinces like Aceh, North Sumatra, and South Sumatra have recorded catastrophic floods nearly every rainy season in recent years, displacing hundreds of thousands of people.
+- In 2020, flooding in South Kalimantan — driven by the same forest loss pattern — displaced over 100,000 residents in days.
+- In Aceh, communities that once relied on predictable seasonal water flow now face both extreme flooding and extended dry-season droughts as watersheds collapse.
+
+The link between deforestation and flood severity is well-established: deforested slopes shed rainwater 5–10× faster than forested ones, and Indonesia's compacted, clay-heavy soils offer little absorption capacity once the root systems that held them are gone.
+
+**The monitoring gap is the core problem.** Illegal logging often happens deep in remote areas — accessible only by river or logging road — where no authority is present and where manual satellite review is weeks or months behind the cutting. By the time a violation is detected, the forest is already gone.
+
+---
+
 ## What Is Sentree?
 
-Sentree is a **real-time deforestation monitoring system**. Users submit GPS coordinates, and the system automatically fetches historical satellite imagery, runs AI detection on each frame, and alerts the user if forest cover is actively declining over time.
+Sentree is a **real-time deforestation monitoring system**. Users submit GPS coordinates of any forest area, and the system automatically:
+
+1. Fetches historical satellite images across three time windows (T-60, T-30, and T0 days)
+2. Runs AI detection on each image to measure the footprint of deforested patches
+3. Compares those measurements across time — if the clearing is actively growing, an alert fires
+
+The goal is to collapse the detection lag from weeks to hours, giving rangers, NGOs, and government bodies the earliest possible warning that illegal activity is underway.
 
 ---
 
-## Tech Stack Breakdown
+## How It Works (Simply)
 
-### 1. React 19 + TypeScript — Frontend Dashboard ([src/App.tsx](src/App.tsx))
-
-**What it is:** A component-based UI framework for building interactive browser apps.
-
-**What it does here:**
-- Renders a monitoring dashboard with coordinate input
-- Displays 3 satellite images side-by-side (T-60, T-30, T0 days)
-- Overlays YOLO detection bounding boxes (red boxes with confidence %) directly on each image using canvas-like absolute positioning
-- Shows a bar chart of deforestation area growth across timestamps
-- Polls `/api/history/:aoi_id` every 5 seconds to pull in results as they process
-- Displays an "Active Deforestation Alert" badge when the growth trend is confirmed
-
-**Key interaction:** The frontend is a *passive consumer*. It submits a job, then polls until results arrive. There is no WebSocket — just REST polling.
-
----
-
-### 2. Express.js — Backend API Server ([server.ts](server.ts))
-
-**What it is:** A minimal Node.js HTTP framework. Acts as the API layer and Vite dev middleware host.
-
-**What it does here:**
-- `POST /api/monitor` — receives coordinates from the UI, writes to Redis watchlist, and publishes a job to Kafka
-- `GET /api/history/:aoi_id` — reads processed results from Redis and returns them to the frontend
-- In dev mode, proxies Vite's HMR. In production, serves the built `dist/` folder
-
-**Key design:** The server is non-blocking. It does not run AI or fetch images itself — it just enqueues work to Kafka and returns immediately. The heavy lifting happens in a background consumer also running in the same process.
-
----
-
-### 3. Apache Kafka (KafkaJS) — Event Streaming ([backend/distributed/kafka_wrapper.ts](backend/distributed/kafka_wrapper.ts))
-
-**What it is:** A distributed message broker. Producers write to *topics*, consumers read from them asynchronously.
-
-**What it does here:**
-- Topic: `area-monitoring-requests`
-- **Producer** (`DeforestationProducer`): called by `POST /api/monitor` to enqueue a job `{aoi_id, coords, userId}`
-- **Consumer** (`DeforestationConsumer`, group `eco-sentry-workers`): picks up each job, fetches satellite images, runs YOLO, writes results to Redis
-
-**Why Kafka and not a direct function call?**
-Decoupling. The web request returns instantly without waiting for satellite fetches (which can be slow). It also means you could scale workers independently — 10 API servers and 50 processing workers running from the same topic.
-
-**Current setup:** Single-node broker (1 partition, replication factor 1). Development-only — not production-safe.
-
----
-
-### 4. Redis (ioredis) — State Store ([backend/distributed/redis_wrapper.ts](backend/distributed/redis_wrapper.ts))
-
-**What it is:** An in-memory key-value store. Extremely fast for reads/writes.
-
-**What it does here:**
-- `watchlist:{userId}` → stores the coordinates a user is monitoring
-- `area:{aoi_id}` → stores the full analysis result (frames, detection bboxes, areas in km², timestamps)
-- Acts as the bridge between the Kafka consumer (writer) and the HTTP layer (reader)
-
-**Why Redis and not a database?**
-Two reasons from the architecture: (1) Speed — results need to be available to polling within seconds. (2) Deduplication — if multiple sensors fire for the same area, Redis can be used as a check-before-alert gate (not yet fully implemented, but that's the design intent).
-
----
-
-### 5. NASA GIBS API — Satellite Imagery ([backend/data_fetcher/geengine_worker.ts](backend/data_fetcher/geengine_worker.ts))
-
-**What it is:** NASA's Global Imagery Browse Services — a free WMS (Web Map Service) serving satellite imagery from multiple geostationary and polar-orbiting sources. No API key required.
-
-**What it does here:**
-- Given coordinates + a 0.25° radius (~25 km), builds a bounding box
-- Selects the best satellite for the given longitude (see table below)
-- For sub-daily satellites: fetches **10 images per day** at 30-minute intervals centered on the local solar noon, across T0, T-30, and T-60 days (**30 images total**)
-- For the MODIS fallback: fetches 1 daily composite per day (3 images total)
-- The solar noon window is computed dynamically from longitude — `solar noon UTC = 12 - (lng / 15)` — so the sampling window is always local daytime regardless of where the coordinates are
-- All responses are content-type validated; XML error responses from GIBS throw before reaching Roboflow
-
-**Satellite selection by longitude:**
-
-| Longitude range | Satellite | Sub-daily? | Notes |
-|---|---|---|---|
-| −145° to −5° | **GOES-East** | Yes (10 samples/day) | Americas |
-| 70° to 160° | **Himawari-9** | Yes (10 samples/day) | Asia-Pacific (incl. Sumatra, Australia, Japan) |
-| >160° or <−145° | **GOES-West** | Yes (10 samples/day) | Far Pacific, Hawaii |
-| −5° to 70° | **MODIS-Terra** | No (1 sample/day) | Europe, Africa, Middle East — no geostationary source in GIBS |
-
-**Why not Google Earth Engine?**
-No auth needed with GIBS, making local development and CI trivially easy.
-
----
-
-### 6. Roboflow YOLOv11 — AI Deforestation Detection ([backend/ai/yolo_engine.ts](backend/ai/yolo_engine.ts))
-
-**What it is:** A cloud-hosted inference API for a YOLOv11 model trained on deforestation imagery (hosted at Roboflow Universe).
-
-**What it does here:**
-- Accepts a base64 image
-- Returns detection bounding boxes with class labels (e.g., `deforestation`, `logging_road`) and confidence scores
-- Each pixel bbox is converted to km² using latitude-aware geographic math:
-  ```
-  1° latitude ≈ 111 km
-  1° longitude ≈ 111.32 × cos(lat) km
-  ```
-
-**Key output:** Per-detection `area_sqkm`, aggregated per image, then **averaged across all 10 intraday samples** to produce a cloud-cover-resistant area estimate per day.
-
-**Growth alert logic (in [server.ts](server.ts)):**
 ```
-if avgArea(T0) > avgArea(T-30) > avgArea(T-60) → ACTIVE DEFORESTATION (alert)
-else → STABLE / NON-THREAT
+You enter coordinates → The system fetches satellite images from the last 60 days
+                      → AI scans each image for deforestation patches
+                      → If the patches are growing, you get an alert
 ```
 
----
+There are three days of imagery (T-60, T-30, T0). Each day, multiple images are captured at 30-minute intervals around midday to reduce the chance that clouds block the view. The AI averages all the clean images per day to produce a reliable area estimate.
 
-### 7. Vite + TailwindCSS + Motion — Frontend Build & Styling
-
-**Vite:** Fast dev server with HMR. Bundles React for production. Path alias `@/*` maps to `src/`.
-
-**Tailwind v4:** Utility-first CSS, configured via plugin in `vite.config.ts`. No `tailwind.config.js` needed.
-
-**Motion (Framer Motion):** Handles entrance animations on cards and alert badges.
+If `area today > area 30 days ago > area 60 days ago`, the system flags it as **Active Deforestation**.
 
 ---
 
-### 8. Docker Compose — Local Infrastructure ([docker-compose.yml](docker-compose.yml))
+## Tech Stack
 
-Spins up:
-- **Redis** on `localhost:6379`
-- **Apache Kafka 3.8** on `localhost:9092` (KRaft mode — no ZooKeeper)
-
-```bash
-docker compose up -d
-```
+| Component | Role |
+|---|---|
+| **React + TypeScript** | Web dashboard — displays satellite images, detection overlays, and trend charts |
+| **Express.js** | Backend API — accepts coordinate submissions, serves results |
+| **Apache Kafka** | Job queue — decouples coordinate submission from the slow work of fetching images and running AI |
+| **Redis** | Fast result cache — stores detection results so the dashboard can poll and display them in near-real-time |
+| **NASA GIBS API** | Free satellite imagery (GOES-East, Himawari-9, MODIS) — no API key required |
+| **Roboflow YOLOv11** | Cloud-hosted AI model trained on deforestation imagery — identifies cleared patches and logging roads |
+| **Docker Compose** | Spins up Kafka and Redis locally with a single command |
 
 ---
 
-## Data Flow — End to End
+## Data Flow
 
 ```
 User enters coords → POST /api/monitor
@@ -161,7 +81,6 @@ User enters coords → POST /api/monitor
                               Compare: avgT0 > avgT-30 > avgT-60?
                                           │
                               Redis: store results {frames, areas, alert}
-                              (representative mid-window image per day)
                                           │
                          Frontend polls GET /api/history/:aoi_id
                                           │
@@ -170,54 +89,110 @@ User enters coords → POST /api/monitor
 
 ---
 
-## What's Missing for Production
+## Satellite Coverage
 
-### Critical / Must-Have
+| Region | Satellite | Frequency |
+|---|---|---|
+| Americas (−145° to −5°) | GOES-East | 10 images/day |
+| Asia-Pacific incl. Sumatra (70° to 160°) | Himawari-9 | 10 images/day |
+| Far Pacific / Hawaii (>160° or <−145°) | GOES-West | 10 images/day |
+| Europe / Africa / Middle East (−5° to 70°) | MODIS-Terra | 1 image/day |
 
-| Gap | What's Needed |
-|---|---|
-| **Kafka durability** | Increase partitions and replication factor (min 3 replicas for fault tolerance). Add topic retention policy. |
-| **Auth & multi-tenancy** | No user authentication exists. `userId` is hardcoded as `"user_default"`. Add JWT/session auth and scope all Redis keys by real user IDs. |
-| **Redis persistence** | Default Redis config is in-memory only. Enable AOF (Append-Only File) or RDB snapshots so results survive restarts. |
-| **Error handling & retries** | Kafka consumer has no dead-letter queue. A failed YOLO or GIBS call silently drops the job. Add retry logic + DLQ topic. |
-| **Secret management** | Roboflow API key is in `.env` committed to the repo. Use a secrets manager (AWS Secrets Manager, Vault, etc.) in production. |
-| **HTTPS / TLS** | No SSL. All traffic is plaintext. Put behind a reverse proxy (Nginx/Caddy) with TLS termination. |
-| **Rate limiting** | No limits on `POST /api/monitor`. One user can flood Kafka. Add per-IP rate limiting at the API layer. |
-
-### High Value / Should-Have
-
-| Enhancement | Why |
-|---|---|
-| **WebSocket or SSE** | Replace 5-second polling with server-sent events for instant result delivery |
-| **Map UI (Leaflet / Mapbox)** | Let users draw bounding boxes on a real map instead of typing raw lat/lng |
-| **Persistent database (PostgreSQL)** | Redis is a cache, not a database. Historical trends and user watchlists should be in Postgres for durability and queryability |
-| **Self-hosted YOLO model** | The Roboflow API has rate limits, latency, and cost at scale. Running YOLO locally (ONNX runtime or TorchServe) eliminates the external dependency |
-| **Proper logging (Pino/Winston)** | Replace `console.log` with structured JSON logs. Ship to Datadog/Grafana Loki in prod |
-| **Health check endpoints** | `/health` and `/ready` endpoints for Kubernetes liveness/readiness probes |
-| **CI/CD pipeline** | GitHub Actions for lint → test → Docker build → deploy |
-| **Containerize the app** | Add a `Dockerfile` for the Node.js server so everything runs in containers (not just Kafka/Redis) |
-| **Monitoring & alerting** | Instrument with Prometheus metrics (Kafka consumer lag, YOLO latency, Redis hit rate) |
-| **Email/SMS notifications** | Currently "alert" only lives in the UI. Wire to Twilio/SendGrid so users get notified even when the app is closed |
-| **Confidence thresholds** | Currently all detections are accepted. Add a configurable minimum confidence filter (e.g., ignore detections < 0.5) |
+Sumatra (roughly 95°–106°E) falls squarely in the Himawari-9 coverage zone, giving the best possible intraday temporal resolution for that region.
 
 ---
 
-## Getting Started Locally
+## Getting Started
 
 ```bash
 # 1. Start infrastructure
 docker compose up -d
 
-# 2. Install deps
+# 2. Install dependencies
 npm install
 
-# 3. Set your env
+# 3. Configure environment
 cp .env.example .env
-# add your ROBOFLOW_API_KEY
+# Add your ROBOFLOW_API_KEY
 
 # 4. Run
 npm run dev
 # → http://localhost:5173
 ```
 
-The backend and frontend run from a single `npm run dev` command — Express serves the API and Vite handles the frontend via middleware.
+The backend and frontend start together from a single command — Express handles the API and Vite handles the frontend via middleware.
+
+---
+
+## Scaling to a Real-World Application
+
+The current build is a working proof of concept. Below is a concrete path to production.
+
+### Immediate Hardening (Before Any Real Deployment)
+
+| What | Why |
+|---|---|
+| **Add user authentication** | All user IDs are currently hardcoded. Add JWT auth so each user's watchlist and alerts are scoped correctly. |
+| **Persist Redis to disk** | Default Redis is in-memory only. Enable AOF snapshots or switch results to PostgreSQL so nothing is lost on restart. |
+| **Add a dead-letter queue in Kafka** | A failed image fetch or YOLO call silently drops the job. Route failures to a retry topic so no monitoring request is lost. |
+| **Move secrets out of `.env`** | The Roboflow API key must go into a proper secrets manager (AWS Secrets Manager, HashiCorp Vault) before any shared deployment. |
+| **Increase Kafka replication** | The current single-partition, single-replica setup will lose messages if the broker crashes. Set replication factor to 3 for any production cluster. |
+
+### Growing the System
+
+**Replace polling with push notifications.** The current dashboard polls every 5 seconds. At scale this is wasteful. Switching to Server-Sent Events (SSE) or WebSockets means the UI updates the moment a result is ready, and rangers in the field can receive push alerts on mobile.
+
+**Add a map UI.** Typing raw coordinates is a friction point. Integrating Leaflet or Mapbox lets users draw bounding boxes directly on a map — critical for non-technical field staff.
+
+**Run YOLO on your own infrastructure.** The Roboflow API has rate limits and per-inference costs. At monitoring scale (thousands of coordinates, 30 images each), those costs compound quickly. Hosting the YOLOv11 model on GPU instances (via ONNX Runtime or TorchServe) eliminates the dependency and reduces latency significantly.
+
+**Add a time-series database.** Redis is a cache, not a database. For longitudinal analysis — tracking how a specific area has changed over 12 months, or generating reports for government agencies — a proper time-series database (InfluxDB, TimescaleDB on Postgres) is necessary.
+
+**Wire in SMS and email alerts.** The alert currently only shows up in the browser. Field rangers are not sitting at dashboards. Connecting Twilio (SMS) and SendGrid (email) means an alert reaches the right person regardless of where they are.
+
+**Containerize the application server.** Currently only Kafka and Redis run in Docker. Adding a `Dockerfile` for the Node.js server means the entire stack can be deployed to Kubernetes, enabling horizontal scaling of both the API and the Kafka consumer workers independently.
+
+### Long-Term: A Nationwide Monitoring Grid
+
+The architecture is designed to scale horizontally from the start. Each additional forest region is just another coordinate submitted to Kafka — the worker pool processes them in parallel without any code changes.
+
+A regional deployment covering Sumatra's remaining forest would involve:
+
+- **Pre-seeded watchlist**: NGOs or forestry agencies pre-load known high-risk areas (logging concession boundaries, protected zone perimeters) as permanent monitoring coordinates, rather than waiting for a human to notice a problem
+- **Scheduled re-analysis**: A cron layer triggers re-analysis of each watchlist coordinate on a fixed cadence (every 7 or 30 days), rather than requiring a manual submission
+- **Multi-agency alert routing**: Different alert channels for different stakeholders — rangers get SMS, ministry officials get email summaries, and NGOs get dashboard access
+- **Integration with ground truth**: Connecting field reports from rangers (GPS-tagged photos of logging activity) back into the system to continuously validate and improve the AI model's accuracy over time
+- **Higher-resolution imagery**: NASA GIBS provides free, moderate-resolution imagery. For precise boundary detection and legal-grade evidence, pairing with commercial providers (Planet Labs, Maxar) at selected high-risk sites would improve detection quality significantly
+
+The core insight is that deforestation monitoring is fundamentally a data pipeline problem — and this stack is purpose-built for exactly that: event-driven, horizontally scalable, and decoupled at every layer.
+
+---
+
+## What's Currently Missing for Production
+
+### Critical
+
+| Gap | What's Needed |
+|---|---|
+| **Kafka durability** | Increase partitions and replication factor (min 3 replicas). Add topic retention policy. |
+| **Auth & multi-tenancy** | No authentication exists. `userId` is hardcoded as `"user_default"`. |
+| **Redis persistence** | In-memory only by default. Enable AOF or RDB snapshots. |
+| **Error handling & retries** | No dead-letter queue. Failed jobs are silently dropped. |
+| **Secret management** | Roboflow API key in `.env`. Use a secrets manager in production. |
+| **HTTPS / TLS** | No SSL. Put behind a reverse proxy (Nginx/Caddy) with TLS termination. |
+| **Rate limiting** | No limits on `POST /api/monitor`. One user can flood Kafka. |
+
+### High Value
+
+| Enhancement | Why |
+|---|---|
+| **WebSocket or SSE** | Replace 5-second polling with instant result push |
+| **Map UI (Leaflet / Mapbox)** | Draw bounding boxes on a real map instead of typing raw coordinates |
+| **PostgreSQL** | Durable storage for historical trends and user watchlists |
+| **Self-hosted YOLO model** | Eliminate Roboflow rate limits and latency at scale |
+| **Structured logging (Pino/Winston)** | Replace `console.log` with JSON logs, shipped to Datadog or Grafana Loki |
+| **Health check endpoints** | `/health` and `/ready` for Kubernetes liveness/readiness probes |
+| **CI/CD pipeline** | GitHub Actions: lint → test → Docker build → deploy |
+| **Prometheus metrics** | Kafka consumer lag, YOLO inference latency, Redis hit rate |
+| **Email/SMS notifications** | Wire alerts to Twilio/SendGrid for out-of-browser delivery |
+| **Confidence thresholds** | Configurable minimum confidence filter (e.g., discard detections < 0.5) |

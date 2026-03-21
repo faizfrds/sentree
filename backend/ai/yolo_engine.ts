@@ -14,13 +14,16 @@ export interface DetectionResult {
  * Runs the Roboflow deforestation detection model on a base64-encoded satellite image.
  * @param imageBase64 - The base64-encoded image (JPEG/PNG)
  * @param latCenter  - Latitude of the image center (for area calculation)
- * @param imageDeltaDeg - Half-extent of the image in degrees (default 0.25°)
+ * @param imageDeltaDeg - Half-extent of the image in degrees (default ≈ 0.0001373°, 10,000 ft² — must match fetchTimeseriesImages delta)
  * @param imageSize  - Pixel dimensions of the image (default 512)
  */
+// Mirrors TARGET_DELTA_DEG in geengine_worker.ts: sqrt(10000) * 0.0003048 / 2 / 111
+const DEFAULT_IMAGE_DELTA_DEG = (Math.sqrt(10_000) * 0.0003048) / 2 / 111;
+
 export async function detectDeforestationSegments(
   imageBase64: string,
   latCenter = 0,
-  imageDeltaDeg = 0.25,
+  imageDeltaDeg = DEFAULT_IMAGE_DELTA_DEG,
   imageSize = 512
 ): Promise<DetectionResult[]> {
   if (!ROBOFLOW_API_KEY) {
